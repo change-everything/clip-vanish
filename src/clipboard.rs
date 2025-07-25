@@ -137,14 +137,14 @@ pub struct ClipboardMonitor {
     crypto_engine: Arc<Mutex<CryptoEngine>>,
     /// 当前加密的剪贴板内容
     encrypted_content: Arc<Mutex<Option<EncryptedData>>>,
-    /// 监听器状态
-    state: Arc<Mutex<ClipboardState>>,
     /// 事件回调函数
-    event_callback: Option<EventCallback>,
+    event_callback: Arc<Mutex<Option<EventCallback>>>,
     /// 是否应该停止监听
     should_stop: Arc<Mutex<bool>>,
     /// 上次剪贴板内容的哈希（用于检测变化）
     last_content_hash: Arc<Mutex<u64>>,
+    /// 监听器状态
+    state: Arc<Mutex<ClipboardState>>,
 }
 
 impl ClipboardMonitor {
@@ -171,10 +171,10 @@ impl ClipboardMonitor {
             clipboard_ctx: Arc::new(Mutex::new(clipboard_ctx)),
             crypto_engine: Arc::new(Mutex::new(crypto_engine)),
             encrypted_content: Arc::new(Mutex::new(None)),
-            state: Arc::new(Mutex::new(state)),
-            event_callback: None,
+            event_callback: Arc::new(Mutex::new(None)),
             should_stop: Arc::new(Mutex::new(false)),
             last_content_hash: Arc::new(Mutex::new(0)),
+            state: Arc::new(Mutex::new(state)),
         })
     }
     
@@ -182,8 +182,9 @@ impl ClipboardMonitor {
     /// 
     /// # 参数
     /// * `callback` - 事件回调函数
-    pub fn set_event_callback(&mut self, callback: EventCallback) {
-        self.event_callback = Some(callback);
+    pub fn set_event_callback(&self, callback: EventCallback) {
+        let mut event_callback = self.event_callback.lock().unwrap();
+        *event_callback = Some(callback);
     }
     
     /// 开始监听剪贴板
@@ -196,13 +197,6 @@ impl ClipboardMonitor {
     pub async fn start_monitoring(&self, poll_interval: Duration) -> Result<(), ClipboardError> {
         info!("开始监听剪贴板变化，轮询间隔: {:?}", poll_interval);
         
-        // 更新状态
-        {
-            let mut state = self.state.lock().unwrap();
-            state.is_running = true;
-            state.start_time = Instant::now();
-        }
-        
         // 重置停止标志
         *self.should_stop.lock().unwrap() = false;
         
@@ -213,12 +207,6 @@ impl ClipboardMonitor {
             }
             
             sleep(poll_interval).await;
-        }
-        
-        // 更新状态
-        {
-            let mut state = self.state.lock().unwrap();
-            state.is_running = false;
         }
         
         info!("剪贴板监听已停止");
@@ -267,7 +255,7 @@ impl ClipboardMonitor {
                 *self.last_content_hash.lock().unwrap() = content_hash;
                 
                 // 触发事件回调
-                if let Some(callback) = &self.event_callback {
+                if let Some(callback) = &*self.event_callback.lock().unwrap() {
                     let event = ClipboardEvent::ContentCopied {
                         length: content.len(),
                         content_type: ContentType::Text,
@@ -316,7 +304,7 @@ impl ClipboardMonitor {
             let content = String::from_utf8_lossy(&decrypted_bytes).to_string();
             
             // 触发粘贴事件
-            if let Some(callback) = &self.event_callback {
+            if let Some(callback) = &*self.event_callback.lock().unwrap() {
                 let event = ClipboardEvent::ContentPasted {
                     timestamp: Instant::now(),
                 };
@@ -355,15 +343,8 @@ impl ClipboardMonitor {
         // 重置内容哈希
         *self.last_content_hash.lock().unwrap() = 0;
         
-        // 更新状态
-        {
-            let mut state = self.state.lock().unwrap();
-            state.encrypted_content_length = 0;
-            state.total_events += 1;
-        }
-        
         // 触发事件回调
-        if let Some(callback) = &self.event_callback {
+        if let Some(callback) = &*self.event_callback.lock().unwrap() {
             let event = ClipboardEvent::ContentCleared {
                 reason: reason.clone(),
                 timestamp: Instant::now(),

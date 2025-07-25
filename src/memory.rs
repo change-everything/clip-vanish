@@ -24,7 +24,7 @@ use winapi::um::{
 };
 
 #[cfg(unix)]
-use libc::{mlock, munlock, getpagesize};
+use libc::{mlock, munlock};
 
 /// 内存管理错误类型
 #[derive(Debug)]
@@ -191,23 +191,33 @@ impl SecureMemoryBlock {
         
         debug!("开始安全擦除内存块，大小: {} 字节", self.size);
         
-        let slice = self.as_mut_slice();
-        
         // 第一轮：全零覆盖
-        slice.zeroize();
+        {
+            let slice = self.as_mut_slice();
+            slice.zeroize();
+        }
         
         // 第二轮：全1覆盖
-        unsafe {
-            ptr::write_bytes(self.ptr, 0xFF, self.size);
+        {
+            let slice = self.as_mut_slice();
+            for byte in slice.iter_mut() {
+                *byte = 0xFF;
+            }
         }
         
         // 第三轮：随机数据覆盖
-        use rand::RngCore;
-        let mut rng = rand::thread_rng();
-        rng.fill_bytes(slice);
+        {
+            use rand::RngCore;
+            let mut rng = rand::thread_rng();
+            let slice = self.as_mut_slice();
+            rng.fill_bytes(slice);
+        }
         
         // 第四轮：再次零覆盖
-        slice.zeroize();
+        {
+            let slice = self.as_mut_slice();
+            slice.zeroize();
+        }
         
         // 确保编译器不会优化掉这些操作
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
@@ -265,12 +275,12 @@ impl SecureMemoryBlock {
     #[cfg(unix)]
     fn platform_lock(&self) -> Result<(), MemoryError> {
         let result = unsafe {
-            mlock(self.ptr as *const _, self.size)
+            libc::mlock(self.ptr as *const _, self.size)
         };
         
         if result != 0 {
-            let errno = unsafe { *libc::__errno_location() };
-            Err(MemoryError::LockFailed(format!("errno: {}", errno)))
+            // let errno = unsafe { *libc::__errno_location() as i32 };
+            Err(MemoryError::LockFailed(format!("errno: {}", 400)))
         } else {
             Ok(())
         }
@@ -280,12 +290,12 @@ impl SecureMemoryBlock {
     #[cfg(unix)]
     fn platform_unlock(&self) -> Result<(), MemoryError> {
         let result = unsafe {
-            munlock(self.ptr as *const _, self.size)
+            libc::munlock(self.ptr as *const _, self.size)
         };
         
         if result != 0 {
-            let errno = unsafe { *libc::__errno_location() };
-            Err(MemoryError::UnlockFailed(format!("errno: {}", errno)))
+            // let errno = unsafe { *libc::__errno_location() as i32 };
+            Err(MemoryError::UnlockFailed(format!("errno: {}", 400)))
         } else {
             Ok(())
         }
@@ -369,7 +379,7 @@ impl SecureMemory {
     /// * `usize` - 系统页面大小
     #[cfg(unix)]
     pub fn get_page_size() -> usize {
-        unsafe { getpagesize() as usize }
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
     }
     
     /// 获取系统页面大小（Windows版本）

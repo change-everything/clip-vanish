@@ -141,18 +141,18 @@ impl CliHandler {
             self.display_startup_info(timer_duration);
         }
         
-        // 初始化剪贴板监听器
+        // 创建和初始化必要的组件
         let clipboard_monitor = Arc::new(
             ClipboardMonitor::new()
                 .map_err(|e| CliError::ClipboardError(e.to_string()))?
         );
         
-        // 初始化定时器
-        let mut destruct_timer = DestructTimer::new();
-        destruct_timer.start_service().await
-            .map_err(|e| CliError::TimerError(e.to_string()))?;
-        
-        let destruct_timer = Arc::new(Mutex::new(destruct_timer));
+        let destruct_timer = Arc::new(Mutex::new({
+            let mut timer = DestructTimer::new();
+            timer.start_service().await
+                .map_err(|e| CliError::TimerError(e.to_string()))?;
+            timer
+        }));
         
         // 设置事件回调
         self.setup_event_callbacks(&clipboard_monitor, &destruct_timer, timer_duration);
@@ -174,15 +174,21 @@ impl CliHandler {
         self.clipboard_monitor = Some(clipboard_monitor.clone());
         self.destruct_timer = Some(destruct_timer.clone());
         
-        // 启动监听循环
+        // 启动监听循环（在后台）
         let poll_interval = self.config.get_poll_interval();
-        let clipboard_task = clipboard_monitor.start_monitoring(poll_interval);
+        let status_clone = self.service_status.clone();
+        let should_stop_clone = self.should_stop.clone();
         
-        // 启动状态更新任务
-        let status_task = self.start_status_update_task();
-        
-        // 启动信号处理任务
-        let signal_task = self.start_signal_handler();
+        tokio::spawn(async move {
+            let result = clipboard_monitor.start_monitoring(poll_interval).await;
+            if let Err(e) = result {
+                error!("剪贴板监听任务失败: {}", e);
+                // 更新状态为非运行
+                if let Ok(mut status) = status_clone.lock() {
+                    status.is_running = false;
+                }
+            }
+        });
         
         println!("✅ ClipVanish服务已启动");
         println!("   自毁倒计时: {}秒", timer_duration);
@@ -192,24 +198,6 @@ impl CliHandler {
             println!("\n📊 实时状态 (按 Ctrl+C 退出):");
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         }
-        
-        // 等待任务完成或收到停止信号
-        tokio::select! {
-            result = clipboard_task => {
-                if let Err(e) = result {
-                    error!("剪贴板监听任务失败: {}", e);
-                }
-            },
-            _ = status_task => {
-                debug!("状态更新任务结束");
-            },
-            _ = signal_task => {
-                info!("收到退出信号");
-            },
-        }
-        
-        // 清理资源
-        self.cleanup_service().await?;
         
         Ok(())
     }
@@ -488,7 +476,7 @@ impl CliHandler {
             .map_err(|e| CliError::HotkeyError(e.to_string()))?;
         
         // 启动热键事件处理
-        let monitor_clone = clipboard_monitor.clone();
+        let monitor_clone = Arc::clone(clipboard_monitor);
         tokio::spawn(async move {
             let receiver = GlobalHotKeyEvent::receiver();
             
