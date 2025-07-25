@@ -1,0 +1,35 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 配置文件（可能包含敏感信息）
+config.json
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+
+# 构建产物
+/dist/
+/build/
+
+# 测试覆盖率
+/coverage/
+tarpaulin-report.html
+
+# 性能分析
+*.profraw
+perf.data*

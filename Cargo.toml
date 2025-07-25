@@ -1,0 +1,57 @@
+[package]
+name = "clipvanish"
+version = "0.1.0"
+edition = "2021"
+authors = ["ClipVanish Team"]
+description = "Physical-level self-destructing clipboard tool for ultimate privacy protection"
+license = "MIT"
+repository = "https://github.com/clipvanish/clipvanish"
+keywords = ["clipboard", "security", "privacy", "encryption", "self-destruct"]
+categories = ["command-line-utilities", "cryptography"]
+
+[dependencies]
+# 加密库 - 使用AES-GCM-SIV避免时序攻击
+aes-gcm-siv = "0.11"
+# 随机数生成
+rand = "0.8"
+# 命令行参数解析
+clap = { version = "4.0", features = ["derive"] }
+# 异步运行时
+tokio = { version = "1.0", features = ["full"] }
+# 日志记录
+log = "0.4"
+env_logger = "0.10"
+# 跨平台剪贴板访问
+clipboard = "0.5"
+# 全局热键支持
+global-hotkey = "0.4"
+# 内存安全操作
+zeroize = { version = "1.6", features = ["zeroize_derive"] }
+# 系统托盘（可选）
+tray-icon = "0.8"
+# 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(windows)'.dependencies]
+# Windows特定依赖
+winapi = { version = "0.3", features = ["winuser", "processthreadsapi", "memoryapi"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS特定依赖
+cocoa = "0.24"
+objc = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+# Unix/Linux特定依赖
+libc = "0.2"
+
+[profile.release]
+# 发布版本优化
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
