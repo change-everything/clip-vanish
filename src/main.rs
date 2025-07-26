@@ -82,6 +82,9 @@ enum Commands {
         reset: bool,
     },
     
+    /// 查看剪贴板历史记录
+    History,
+    
     /// 退出程序
     Exit,
 }
@@ -180,12 +183,59 @@ async fn main() {
     }
 }
 
+/// 执行命令
+async fn execute_command(cli_handler: &mut CliHandler, command: Commands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        Commands::Start { timer, daemon } => {
+            cli_handler.start_monitoring(timer, daemon).await?;
+        },
+        Commands::Nuke { force } => {
+            cli_handler.emergency_nuke(force).await?;
+        },
+        Commands::Status => {
+            cli_handler.show_status().await?;
+        },
+        Commands::Stop => {
+            cli_handler.stop_service().await?;
+        },
+        Commands::Config { reset } => {
+            cli_handler.manage_config(reset).await?;
+        },
+        Commands::Exit => {
+            // 交互模式下的退出命令，在主循环中处理
+        },
+        Commands::History => {
+            cli_handler.show_history().await?;
+        },
+    }
+    Ok(())
+}
+
+/// 初始化日志系统
+fn init_logger(verbose: bool, silent: bool) {
+    let log_level = if silent {
+        "error"
+    } else if verbose {
+        "debug"
+    } else {
+        "info"
+    };
+    
+    std::env::set_var("RUST_LOG", format!("clipvanish={}", log_level));
+    env_logger::init();
+    
+    if verbose {
+        info!("日志系统已初始化，级别: {}", log_level);
+    }
+}
+
 /// 打印帮助信息
 fn print_help() {
     println!("可用命令：");
     println!("  start [--timer <seconds>] [--daemon]  启动剪贴板监听服务");
     println!("  nuke [--force]                       紧急销毁所有数据");
     println!("  status                               显示当前状态");
+    println!("  history                              查看剪贴板历史记录");
     println!("  stop                                 停止服务");
     println!("  config [--reset]                     查看/重置配置");
     println!("  help                                 显示此帮助信息");
@@ -233,60 +283,12 @@ fn parse_interactive_command(input: &str) -> Result<Commands, String> {
         }
         "status" => Ok(Commands::Status),
         "stop" => Ok(Commands::Stop),
+        "history" => Ok(Commands::History),
         "config" => {
             let reset = parts.get(1).map_or(false, |&arg| arg == "--reset");
             Ok(Commands::Config { reset })
         }
         "exit" => Ok(Commands::Exit),
         _ => Err(format!("未知命令: {}", parts[0])),
-    }
-}
-
-/// 执行命令
-async fn execute_command(cli_handler: &mut CliHandler, command: Commands) -> Result<(), Box<dyn std::error::Error>> {
-    match command {
-        Commands::Start { timer, daemon } => {
-            // 使用克隆的引用来启动服务
-            cli_handler.start_monitoring(timer, false).await?;
-            Ok(())
-        },
-        Commands::Nuke { force } => {
-            cli_handler.emergency_nuke(force).await?;
-            Ok(())
-        },
-        Commands::Status => {
-            cli_handler.show_status().await?;
-            Ok(())
-        },
-        Commands::Stop => {
-            cli_handler.stop_service().await?;
-            Ok(())
-        },
-        Commands::Config { reset } => {
-            cli_handler.manage_config(reset).await?;
-            Ok(())
-        },
-        Commands::Exit => {
-            // 交互模式下的退出命令，在主循环中处理
-            Ok(())
-        },
-    }
-}
-
-/// 初始化日志系统
-fn init_logger(verbose: bool, silent: bool) {
-    let log_level = if silent {
-        "error"
-    } else if verbose {
-        "debug"
-    } else {
-        "info"
-    };
-    
-    std::env::set_var("RUST_LOG", format!("clipvanish={}", log_level));
-    env_logger::init();
-    
-    if verbose {
-        info!("日志系统已初始化，级别: {}", log_level);
     }
 }

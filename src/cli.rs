@@ -20,7 +20,7 @@ use global_hotkey::{GlobalHotKeyManager, HotKeyState, GlobalHotKeyEvent};
 use global_hotkey::hotkey::{HotKey, Modifiers, Code};
 
 use crate::config::Config;
-use crate::clipboard::{ClipboardMonitor, ClipboardEvent, ClearReason};
+use crate::clipboard::{ClipboardMonitor, ClipboardEvent, ClearReason, ClipboardOperation};
 use crate::timer::{DestructTimer, TimerEvent, TimerState};
 use crate::memory::SecureMemory;
 
@@ -131,9 +131,12 @@ impl CliHandler {
         info!("启动ClipVanish监听服务");
         
         // 检查是否已经在运行
-        if self.service_status.lock().unwrap().is_running {
-            println!("⚠️  ClipVanish服务已在运行");
-            return Ok(());
+        {
+            let is_running = self.service_status.lock().unwrap().is_running;
+            if is_running {
+                println!("⚠️  ClipVanish服务已在运行");
+                return Ok(());
+            }
         }
         
         // 显示启动信息
@@ -141,62 +144,77 @@ impl CliHandler {
             self.display_startup_info(timer_duration);
         }
         
-        // 创建和初始化必要的组件
+        // 初始化剪贴板监听器
         let clipboard_monitor = Arc::new(
             ClipboardMonitor::new()
                 .map_err(|e| CliError::ClipboardError(e.to_string()))?
         );
         
+        // 初始化定时器
         let destruct_timer = Arc::new(Mutex::new({
             let mut timer = DestructTimer::new();
             timer.start_service().await
                 .map_err(|e| CliError::TimerError(e.to_string()))?;
             timer
         }));
+
+        // 首先克隆所需的引用
+        let status_clone = self.service_status.clone();
+        let should_stop_clone = self.should_stop.clone();
+        let config_clone = self.config.clone();
         
         // 设置事件回调
         self.setup_event_callbacks(&clipboard_monitor, &destruct_timer, timer_duration);
         
+        // 保存组件引用（在注册热键之前）
+        self.clipboard_monitor = Some(clipboard_monitor.clone());
+        self.destruct_timer = Some(destruct_timer.clone());
+        
         // 注册全局热键
-        if self.config.hotkeys.enable_global_hotkeys {
+        if config_clone.hotkeys.enable_global_hotkeys {
             self.register_global_hotkeys(&clipboard_monitor, &destruct_timer)?;
         }
         
         // 更新服务状态
         {
-            let mut status = self.service_status.lock().unwrap();
+            let mut status = status_clone.lock().unwrap();
             status.is_running = true;
             status.start_time = Some(Instant::now());
             status.total_events = 0;
         }
         
-        // 保存组件引用
-        self.clipboard_monitor = Some(clipboard_monitor.clone());
-        self.destruct_timer = Some(destruct_timer.clone());
+        // 启动监听循环
+        let poll_interval = config_clone.get_poll_interval();
         
-        // 启动监听循环（在后台）
-        let poll_interval = self.config.get_poll_interval();
-        let status_clone = self.service_status.clone();
-        let should_stop_clone = self.should_stop.clone();
-        
-        tokio::spawn(async move {
-            let result = clipboard_monitor.start_monitoring(poll_interval).await;
-            if let Err(e) = result {
-                error!("剪贴板监听任务失败: {}", e);
-                // 更新状态为非运行
-                if let Ok(mut status) = status_clone.lock() {
-                    status.is_running = false;
+        // 在后台启动监听任务
+        let monitor_task = {
+            let monitor = clipboard_monitor.clone();
+            tokio::spawn(async move {
+                if let Err(e) = monitor.start_monitoring(poll_interval).await {
+                    error!("剪贴板监听任务失败: {}", e);
+                    // 更新状态为非运行
+                    if let Ok(mut status) = status_clone.lock() {
+                        status.is_running = false;
+                    }
                 }
-            }
-        });
+            })
+        };
         
         println!("✅ ClipVanish服务已启动");
         println!("   自毁倒计时: {}秒", timer_duration);
-        println!("   紧急销毁热键: {}", self.config.hotkeys.emergency_nuke_key);
+        println!("   紧急销毁热键: {}", config_clone.hotkeys.emergency_nuke_key);
         
         if !daemon_mode {
             println!("\n📊 实时状态 (按 Ctrl+C 退出):");
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            return Ok(());
+        }
+        
+        // 在后台模式下等待任务完成
+        tokio::select! {
+            _ = monitor_task => {
+                debug!("监听任务结束");
+            }
         }
         
         Ok(())
@@ -357,6 +375,52 @@ impl CliHandler {
             println!("✅ 配置已重置为默认值");
         } else {
             self.config.display();
+        }
+        
+        Ok(())
+    }
+    
+    /// 显示历史记录
+    pub async fn show_history(&self) -> Result<(), CliError> {
+        if let Some(monitor) = &self.clipboard_monitor {
+            let history = monitor.get_history();
+            
+            if history.is_empty() {
+                println!("📋 暂无剪贴板历史记录");
+                return Ok(());
+            }
+
+            println!("📋 剪贴板历史记录");
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            
+            for (index, item) in history.iter().enumerate() {
+                let elapsed = item.timestamp.elapsed();
+                println!("#{} - {} 前", 
+                    history.len() - index,
+                    Self::format_duration(elapsed)
+                );
+                
+                match item.operation {
+                    ClipboardOperation::Copy => {
+                        println!("   📥 复制: {} 字节", item.length);
+                    },
+                    ClipboardOperation::Paste => {
+                        println!("   📤 粘贴操作");
+                    },
+                    ClipboardOperation::Clear(ref reason) => {
+                        let reason_str = match reason {
+                            ClearReason::TimerExpired => "倒计时到期",
+                            ClearReason::ManualClear => "手动清除",
+                            ClearReason::EmergencyNuke => "紧急销毁",
+                            ClearReason::Shutdown => "程序退出",
+                        };
+                        println!("   🧹 清除: {}", reason_str);
+                    },
+                }
+                println!();
+            }
+        } else {
+            println!("⚠️ 服务未运行，无法获取历史记录");
         }
         
         Ok(())

@@ -109,8 +109,32 @@ pub enum ClearReason {
     Shutdown,
 }
 
+/// 剪贴板操作类型
+#[derive(Debug, Clone)]
+pub enum ClipboardOperation {
+    /// 复制
+    Copy,
+    /// 粘贴
+    Paste,
+    /// 清除（带原因）
+    Clear(ClearReason),
+}
+
 /// 剪贴板事件回调函数类型
 pub type EventCallback = Arc<dyn Fn(ClipboardEvent) + Send + Sync>;
+
+/// 剪贴板历史记录项
+#[derive(Debug, Clone)]
+pub struct ClipboardHistoryItem {
+    /// 操作时间
+    pub timestamp: Instant,
+    /// 内容长度（字节）
+    pub length: usize,
+    /// 内容类型
+    pub content_type: ContentType,
+    /// 操作类型
+    pub operation: ClipboardOperation,
+}
 
 /// 剪贴板监听器状态
 #[derive(Debug, Clone)]
@@ -145,6 +169,8 @@ pub struct ClipboardMonitor {
     last_content_hash: Arc<Mutex<u64>>,
     /// 监听器状态
     state: Arc<Mutex<ClipboardState>>,
+    /// 历史记录
+    history: Arc<Mutex<Vec<ClipboardHistoryItem>>>,
 }
 
 impl ClipboardMonitor {
@@ -175,6 +201,7 @@ impl ClipboardMonitor {
             should_stop: Arc::new(Mutex::new(false)),
             last_content_hash: Arc::new(Mutex::new(0)),
             state: Arc::new(Mutex::new(state)),
+            history: Arc::new(Mutex::new(Vec::new())),
         })
     }
     
@@ -253,6 +280,14 @@ impl ClipboardMonitor {
                 
                 // 更新内容哈希
                 *self.last_content_hash.lock().unwrap() = content_hash;
+                
+                // 添加历史记录
+                self.add_history(ClipboardHistoryItem {
+                    timestamp: Instant::now(),
+                    length: content.len(),
+                    content_type: ContentType::Text,
+                    operation: ClipboardOperation::Copy,
+                });
                 
                 // 触发事件回调
                 if let Some(callback) = &*self.event_callback.lock().unwrap() {
@@ -364,6 +399,21 @@ impl ClipboardMonitor {
     /// * `ClipboardState` - 当前状态的副本
     pub fn get_state(&self) -> ClipboardState {
         self.state.lock().unwrap().clone()
+    }
+    
+    /// 获取历史记录
+    pub fn get_history(&self) -> Vec<ClipboardHistoryItem> {
+        self.history.lock().unwrap().clone()
+    }
+
+    /// 添加历史记录
+    fn add_history(&self, item: ClipboardHistoryItem) {
+        let mut history = self.history.lock().unwrap();
+        history.push(item);
+        // 保持最近100条记录
+        if history.len() > 100 {
+            history.remove(0);
+        }
     }
     
     /// 计算内容哈希（用于检测变化）
