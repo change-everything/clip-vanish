@@ -1,13 +1,13 @@
 /*!
  * ClipVanish™ 配置管理模块
- * 
+ *
  * 负责应用程序配置的加载、保存和管理
  * 特点：
  * - JSON格式配置文件
  * - 默认配置自动生成
  * - 配置验证和错误处理
  * - 跨平台配置目录支持
- * 
+ *
  * 作者: ClipVanish Team
  */
 
@@ -88,6 +88,13 @@ pub struct SecurityConfig {
     pub key_rotation_interval: u64,
     /// 是否在粘贴后立即销毁
     pub destroy_on_paste: bool,
+    /// 触发保护的最小内容长度（字节）
+    /// 超过此长度的内容将被自动加密保护
+    pub min_length_for_protection: usize,
+    /// 敏感内容匹配模式（正则表达式）
+    /// 支持标准正则表达式语法，(?i)表示不区分大小写
+    /// 多个模式使用|分隔，例如: (?i)password|secret|token|api[_-]?key
+    pub sensitive_pattern: String,
 }
 
 impl Default for SecurityConfig {
@@ -98,7 +105,9 @@ impl Default for SecurityConfig {
             auto_clear_on_exit: true,
             enable_key_rotation: false,
             key_rotation_interval: 60, // 1小时
-            destroy_on_paste: true,  // 默认启用粘贴即销毁
+            destroy_on_paste: true,  // 启用粘贴即销毁，测试倒计时删除功能
+            min_length_for_protection: 8, // 降低默认最小保护长度，以更好地保护密码等短文本
+            sensitive_pattern: ".*".to_string(), // 匹配所有内容
         }
     }
 }
@@ -170,7 +179,7 @@ pub struct ClipboardConfig {
 impl Default for ClipboardConfig {
     fn default() -> Self {
         ClipboardConfig {
-            poll_interval_ms: 100,
+            poll_interval_ms: 500, // 增加到500ms，减少对系统剪贴板的干扰
             supported_types: vec!["text".to_string()],
             max_content_length: 1024 * 1024, // 1MB
             enable_length_limit: true,
@@ -193,6 +202,10 @@ pub struct Config {
     pub hotkeys: HotkeyConfig,
     /// 剪贴板配置
     pub clipboard: ClipboardConfig,
+    /// 清除延迟时间（秒）
+    pub clear_delay_seconds: u64,
+    pub min_length_for_protection: usize,
+    pub sensitive_pattern: String,
 }
 
 impl Default for Config {
@@ -204,18 +217,21 @@ impl Default for Config {
             ui: UiConfig::default(),
             hotkeys: HotkeyConfig::default(),
             clipboard: ClipboardConfig::default(),
+            clear_delay_seconds: 30, // 默认30秒
+            min_length_for_protection: 8,
+            sensitive_pattern: ".*".to_string(), // 匹配所有内容
         }
     }
 }
 
 impl Config {
     /// 加载配置文件
-    /// 
+    ///
     /// # 返回值
     /// * `Result<Config, ConfigError>` - 成功返回配置实例
     pub fn load() -> Result<Self, ConfigError> {
         let config_path = Self::get_config_file_path()?;
-        
+
         if config_path.exists() {
             debug!("从文件加载配置: {:?}", config_path);
             Self::load_from_file(&config_path)
@@ -226,21 +242,21 @@ impl Config {
             Ok(config)
         }
     }
-    
+
     /// 从指定文件加载配置
-    /// 
+    ///
     /// # 参数
     /// * `path` - 配置文件路径
-    /// 
+    ///
     /// # 返回值
     /// * `Result<Config, ConfigError>` - 成功返回配置实例
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let content = fs::read_to_string(path.as_ref())
             .map_err(ConfigError::FileReadError)?;
-        
+
         // 尝试加载配置
         let result: Result<Config, _> = serde_json::from_str(&content);
-        
+
         let config = match result {
             Ok(config) => {
                 // 配置加载成功，验证并返回
@@ -250,10 +266,10 @@ impl Config {
             Err(e) => {
                 warn!("配置加载出现问题: {}", e);
                 info!("尝试使用现有值并添加缺失的字段...");
-                
+
                 // 创建默认配置
                 let default_config = Config::default();
-                
+
                 // 尝试解析现有配置
                 if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
                     if let Some(obj) = json.as_object_mut() {
@@ -268,44 +284,44 @@ impl Config {
                                 }
                             }
                         }
-                        
+
                         // 保存更新后的配置并重新加载
                         let path_ref = path.as_ref();
                         let updated_content = serde_json::to_string_pretty(&json)
                             .map_err(ConfigError::ParseError)?;
                         fs::write(path_ref, &updated_content)
                             .map_err(ConfigError::FileWriteError)?;
-                        
+
                         // 使用更新后的内容直接解析，而不是重新读取文件
                         return serde_json::from_str(&updated_content)
                             .map_err(ConfigError::ParseError);
                     }
                 }
-                
+
                 // 如果更新失败，返回默认配置
                 warn!("无法修复配置文件，使用默认配置");
                 default_config
             }
         };
-        
+
         info!("配置加载成功");
         Ok(config)
     }
-    
+
     /// 保存配置到文件
-    /// 
+    ///
     /// # 返回值
     /// * `Result<(), ConfigError>` - 操作结果
     pub fn save(&self) -> Result<(), ConfigError> {
         let config_path = Self::get_config_file_path()?;
         self.save_to_file(&config_path)
     }
-    
+
     /// 保存配置到指定文件
-    /// 
+    ///
     /// # 参数
     /// * `path` - 配置文件路径
-    /// 
+    ///
     /// # 返回值
     /// * `Result<(), ConfigError>` - 操作结果
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ConfigError> {
@@ -314,19 +330,19 @@ impl Config {
             fs::create_dir_all(parent)
                 .map_err(ConfigError::DirectoryCreationError)?;
         }
-        
+
         let content = serde_json::to_string_pretty(self)
             .map_err(ConfigError::ParseError)?;
-        
+
         fs::write(path, content)
             .map_err(ConfigError::FileWriteError)?;
-        
+
         debug!("配置保存成功");
         Ok(())
     }
-    
+
     /// 验证配置的有效性
-    /// 
+    ///
     /// # 返回值
     /// * `Result<(), ConfigError>` - 验证结果
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -336,42 +352,42 @@ impl Config {
                 "最小倒计时不能大于最大倒计时".to_string()
             ));
         }
-        
+
         if self.timer.default_countdown < self.timer.min_countdown ||
-           self.timer.default_countdown > self.timer.max_countdown {
+            self.timer.default_countdown > self.timer.max_countdown {
             return Err(ConfigError::ValidationError(
                 "默认倒计时必须在最小值和最大值之间".to_string()
             ));
         }
-        
+
         if self.timer.warning_threshold > self.timer.default_countdown {
             return Err(ConfigError::ValidationError(
                 "警告阈值不能大于默认倒计时".to_string()
             ));
         }
-        
+
         // 验证安全配置
         if self.security.memory_erase_rounds == 0 {
             return Err(ConfigError::ValidationError(
                 "内存擦除轮数必须大于0".to_string()
             ));
         }
-        
+
         if self.security.memory_erase_rounds > 10 {
             warn!("内存擦除轮数过多可能影响性能: {}", self.security.memory_erase_rounds);
         }
-        
+
         // 验证剪贴板配置
         if self.clipboard.poll_interval_ms == 0 {
             return Err(ConfigError::ValidationError(
                 "轮询间隔必须大于0".to_string()
             ));
         }
-        
+
         if self.clipboard.poll_interval_ms < 50 {
             warn!("轮询间隔过短可能影响性能: {}ms", self.clipboard.poll_interval_ms);
         }
-        
+
         // 验证日志级别
         let valid_log_levels = ["error", "warn", "info", "debug", "trace"];
         if !valid_log_levels.contains(&self.ui.log_level.as_str()) {
@@ -379,13 +395,13 @@ impl Config {
                 format!("无效的日志级别: {}", self.ui.log_level)
             ));
         }
-        
+
         debug!("配置验证通过");
         Ok(())
     }
-    
+
     /// 重置为默认配置
-    /// 
+    ///
     /// # 返回值
     /// * `Result<(), ConfigError>` - 操作结果
     pub fn reset_to_default(&mut self) -> Result<(), ConfigError> {
@@ -394,18 +410,18 @@ impl Config {
         info!("配置已重置为默认值");
         Ok(())
     }
-    
+
     /// 获取配置文件路径
-    /// 
+    ///
     /// # 返回值
     /// * `Result<PathBuf, ConfigError>` - 配置文件路径
     fn get_config_file_path() -> Result<PathBuf, ConfigError> {
         let config_dir = Self::get_config_directory()?;
         Ok(config_dir.join("config.json"))
     }
-    
+
     /// 获取配置目录路径
-    /// 
+    ///
     /// # 返回值
     /// * `Result<PathBuf, ConfigError>` - 配置目录路径
     fn get_config_directory() -> Result<PathBuf, ConfigError> {
@@ -436,78 +452,80 @@ impl Config {
                 })
                 .join("clipvanish")
         };
-        
+
         Ok(config_dir)
     }
-    
+
     /// 获取默认倒计时时长
-    /// 
+    ///
     /// # 返回值
     /// * `Duration` - 默认倒计时时长
     pub fn get_default_countdown_duration(&self) -> Duration {
         Duration::from_secs(self.timer.default_countdown)
     }
-    
+
     /// 获取轮询间隔
-    /// 
+    ///
     /// # 返回值
     /// * `Duration` - 轮询间隔
     pub fn get_poll_interval(&self) -> Duration {
         Duration::from_millis(self.clipboard.poll_interval_ms)
     }
-    
+
     /// 检查是否启用内存锁定
-    /// 
+    ///
     /// # 返回值
     /// * `bool` - 是否启用内存锁定
     pub fn is_memory_locking_enabled(&self) -> bool {
         self.security.enable_memory_locking
     }
-    
+
     /// 获取内存擦除轮数
-    /// 
+    ///
     /// # 返回值
     /// * `u32` - 内存擦除轮数
     pub fn get_memory_erase_rounds(&self) -> u32 {
         self.security.memory_erase_rounds
     }
-    
+
     /// 显示当前配置
     pub fn display(&self) {
         println!("📋 ClipVanish™ 配置信息");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!("🔧 版本: {}", self.version);
         println!();
-        
+
         println!("⏰ 定时器配置:");
         println!("   默认倒计时: {}秒", self.timer.default_countdown);
         println!("   倒计时范围: {}-{}秒", self.timer.min_countdown, self.timer.max_countdown);
         println!("   警告阈值: {}秒", self.timer.warning_threshold);
         println!("   启用警告: {}", if self.timer.enable_warnings { "是" } else { "否" });
         println!();
-        
+
         println!("🛡️ 安全配置:");
         println!("   内存锁定: {}", if self.security.enable_memory_locking { "启用" } else { "禁用" });
         println!("   擦除轮数: {}轮", self.security.memory_erase_rounds);
         println!("   退出时清除: {}", if self.security.auto_clear_on_exit { "是" } else { "否" });
         println!("   密钥轮换: {}", if self.security.enable_key_rotation { "启用" } else { "禁用" });
         println!("   粘贴即销毁: {}", if self.security.destroy_on_paste { "启用" } else { "禁用" });
+        println!("   最小保护长度: {} 字节", self.security.min_length_for_protection);
+        println!("   敏感内容模式: {}", self.security.sensitive_pattern);
         println!();
-        
+
         println!("🎨 界面配置:");
         println!("   详细输出: {}", if self.ui.verbose_output { "是" } else { "否" });
         println!("   显示进度: {}", if self.ui.show_progress { "是" } else { "否" });
         println!("   彩色输出: {}", if self.ui.enable_colors { "是" } else { "否" });
         println!("   日志级别: {}", self.ui.log_level);
         println!();
-        
+
         println!("⌨️ 热键配置:");
         println!("   全局热键: {}", if self.hotkeys.enable_global_hotkeys { "启用" } else { "禁用" });
         println!("   紧急销毁: {}", self.hotkeys.emergency_nuke_key);
         println!("   显示状态: {}", self.hotkeys.show_status_key);
         println!("   切换监听: {}", self.hotkeys.toggle_monitoring_key);
         println!();
-        
+
         println!("📋 剪贴板配置:");
         println!("   轮询间隔: {}ms", self.clipboard.poll_interval_ms);
         println!("   支持类型: {}", self.clipboard.supported_types.join(", "));
@@ -519,7 +537,7 @@ impl Config {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    
+
     #[test]
     fn test_default_config() {
         let config = Config::default();
@@ -528,64 +546,64 @@ mod tests {
         assert!(config.security.enable_memory_locking);
         assert!(config.ui.show_progress);
     }
-    
+
     #[test]
     fn test_config_validation() {
         let mut config = Config::default();
-        
+
         // 测试有效配置
         assert!(config.validate().is_ok());
-        
+
         // 测试无效配置 - 最小倒计时大于最大倒计时
         config.timer.min_countdown = 100;
         config.timer.max_countdown = 50;
         assert!(config.validate().is_err());
-        
+
         // 修复配置
         config.timer.min_countdown = 5;
         config.timer.max_countdown = 3600;
         assert!(config.validate().is_ok());
-        
+
         // 测试无效日志级别
         config.ui.log_level = "invalid".to_string();
         assert!(config.validate().is_err());
     }
-    
+
     #[test]
     fn test_config_save_load() {
         let temp_dir = tempdir().unwrap();
         let config_path = temp_dir.path().join("test_config.json");
-        
+
         let original_config = Config::default();
-        
+
         // 保存配置
         original_config.save_to_file(&config_path).unwrap();
-        
+
         // 加载配置
         let loaded_config = Config::load_from_file(&config_path).unwrap();
-        
+
         // 验证配置一致性
         assert_eq!(original_config.version, loaded_config.version);
         assert_eq!(original_config.timer.default_countdown, loaded_config.timer.default_countdown);
         assert_eq!(original_config.security.memory_erase_rounds, loaded_config.security.memory_erase_rounds);
     }
-    
+
     #[test]
     fn test_duration_helpers() {
         let config = Config::default();
-        
+
         let countdown_duration = config.get_default_countdown_duration();
         assert_eq!(countdown_duration, Duration::from_secs(30));
-        
+
         let poll_interval = config.get_poll_interval();
         assert_eq!(poll_interval, Duration::from_millis(100));
     }
-    
+
     #[test]
     fn test_config_directory() {
         let config_dir = Config::get_config_directory().unwrap();
         assert!(!config_dir.as_os_str().is_empty());
-        
+
         // 配置目录应该包含应用名称
         let path_str = config_dir.to_string_lossy().to_lowercase();
         assert!(path_str.contains("clipvanish") || path_str.contains("ClipVanish"));

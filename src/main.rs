@@ -19,6 +19,7 @@ mod timer;
 mod memory;
 mod cli;
 mod config;
+mod keyboard;
 
 use crate::cli::CliHandler;
 use crate::config::Config;

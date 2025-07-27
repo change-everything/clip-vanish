@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::clipboard::{ClipboardMonitor, ClipboardEvent, ClearReason, ClipboardOperation};
 use crate::timer::{DestructTimer, TimerEvent, TimerState};
 use crate::memory::SecureMemory;
+use crate::keyboard::{KeyboardMonitor, KeyboardEvent};
 
 /// CLI错误类型
 #[derive(Debug)]
@@ -39,6 +40,8 @@ pub enum CliError {
     ServiceNotRunning,
     /// 操作被用户取消
     OperationCancelled,
+    /// 服务运行错误
+    ServiceError(String),
 }
 
 impl std::fmt::Display for CliError {
@@ -50,6 +53,7 @@ impl std::fmt::Display for CliError {
             CliError::HotkeyError(msg) => write!(f, "热键错误: {}", msg),
             CliError::ServiceNotRunning => write!(f, "ClipVanish服务未运行"),
             CliError::OperationCancelled => write!(f, "操作被用户取消"),
+            CliError::ServiceError(msg) => write!(f, "服务错误: {}", msg),
         }
     }
 }
@@ -83,6 +87,8 @@ pub struct CliHandler {
     clipboard_monitor: Option<Arc<ClipboardMonitor>>,
     /// 自毁定时器
     destruct_timer: Option<Arc<Mutex<DestructTimer>>>,
+    /// 键盘监听器
+    keyboard_monitor: Option<Arc<KeyboardMonitor>>,
     /// 全局热键管理器
     hotkey_manager: Option<GlobalHotKeyManager>,
     /// 服务状态
@@ -113,6 +119,7 @@ impl CliHandler {
             config,
             clipboard_monitor: None,
             destruct_timer: None,
+            keyboard_monitor: None,
             hotkey_manager: None,
             service_status: Arc::new(Mutex::new(service_status)),
             should_stop: Arc::new(Mutex::new(false)),
@@ -157,13 +164,17 @@ impl CliHandler {
                 .map_err(|e| CliError::TimerError(e.to_string()))?;
             timer
         }));
+
+        // 初始化键盘监听器
+        let keyboard_monitor = Arc::new(KeyboardMonitor::new());
         
         // 保存组件引用（在注册热键之前）
         self.clipboard_monitor = Some(clipboard_monitor.clone());
         self.destruct_timer = Some(destruct_timer.clone());
+        self.keyboard_monitor = Some(keyboard_monitor.clone());
         
         // 设置事件回调
-        self.setup_event_callbacks(&clipboard_monitor, &destruct_timer, timer_duration);
+        self.setup_event_callbacks(&clipboard_monitor, &destruct_timer, &keyboard_monitor, timer_duration);
         
         // 注册全局热键
         if self.config.hotkeys.enable_global_hotkeys {
@@ -193,18 +204,53 @@ impl CliHandler {
                 }
             })
         };
+
+        // 启动键盘监听任务
+        let keyboard_task = {
+            let keyboard = keyboard_monitor.clone();
+            tokio::spawn(async move {
+                if let Err(e) = keyboard.start_monitoring().await {
+                    error!("键盘监听任务失败: {}", e);
+                }
+            })
+        };
         
         println!("✅ ClipVanish服务已启动");
         println!("   自毁倒计时: {}秒", timer_duration);
         println!("   紧急销毁热键: {}", self.config.hotkeys.emergency_nuke_key);
         
-        if !daemon_mode {
-            println!("\n📊 实时状态 (输入命令继续操作):");
+        if daemon_mode {
+            // 后台模式：启动后立即返回
+            println!("🔄 ClipVanish已在后台启动");
+            Ok(())
+        } else {
+            // 前台模式：保持运行，但不等待监听任务完成
+            // 这样可以避免因为监听任务结束而导致程序退出
+            println!("\n📊 实时状态 (按 Ctrl+C 停止监听):");
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!("🔄 监听服务已在后台运行，程序将持续运行直到手动停止");
+
+            // 使用一个无限循环来保持程序运行，而不是等待监听任务
+            // 这样即使监听任务因为某种原因结束，程序也不会退出
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                // 检查是否应该停止
+                if *self.should_stop.lock().unwrap() {
+                    break;
+                }
+
+                // 检查监听任务是否还在运行
+                if monitor_task.is_finished() {
+                    warn!("监听任务意外结束，尝试重新启动...");
+                    // 这里可以添加重新启动监听的逻辑
+                    break;
+                }
+            }
+
+            println!("📴 ClipVanish监听已停止");
+            Ok(())
         }
-        
-        // 将监听任务放入后台运行，立即返回以保持命令行可用
-        Ok(())
     }
     
     /// 紧急销毁所有数据
@@ -336,7 +382,12 @@ impl CliHandler {
         if let Some(monitor) = &self.clipboard_monitor {
             monitor.stop_monitoring();
         }
-        
+
+        // 停止键盘监听
+        if let Some(keyboard) = &self.keyboard_monitor {
+            keyboard.stop_monitoring();
+        }
+
         // 停止定时器
         if let Some(timer) = &self.destruct_timer {
             let timer = timer.lock().unwrap();
@@ -426,6 +477,7 @@ impl CliHandler {
         &self,
         clipboard_monitor: &Arc<ClipboardMonitor>,
         destruct_timer: &Arc<Mutex<DestructTimer>>,
+        keyboard_monitor: &Arc<KeyboardMonitor>,
         timer_duration: u64,
     ) {
         let timer_clone = destruct_timer.clone();
@@ -519,6 +571,30 @@ impl CliHandler {
         });
         
         destruct_timer.lock().unwrap().set_callback(timer_callback);
+
+        // 键盘事件回调
+        let clipboard_clone = clipboard_monitor.clone();
+        let keyboard_callback = Arc::new(move |event: KeyboardEvent| {
+            match event {
+                KeyboardEvent::PasteDetected { timestamp: _, key_combination } => {
+                    info!("🔍 检测到粘贴操作: {}", key_combination);
+
+                    // 触发剪贴板的粘贴处理
+                    if let Ok(Some(decrypted_content)) = clipboard_clone.get_decrypted_content() {
+                        if let Err(e) = clipboard_clone.handle_paste(&decrypted_content) {
+                            error!("处理粘贴操作失败: {}", e);
+                        }
+                    } else {
+                        debug!("粘贴操作检测到，但没有加密内容需要处理");
+                    }
+                },
+                KeyboardEvent::OtherShortcut { keys, .. } => {
+                    debug!("检测到其他快捷键: {:?}", keys);
+                },
+            }
+        });
+
+        keyboard_monitor.set_event_callback(keyboard_callback);
     }
     
     /// 注册全局热键
