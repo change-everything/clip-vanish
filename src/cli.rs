@@ -146,7 +146,7 @@ impl CliHandler {
         
         // 初始化剪贴板监听器
         let clipboard_monitor = Arc::new(
-            ClipboardMonitor::new()
+            ClipboardMonitor::new(self.config.clone())
                 .map_err(|e| CliError::ClipboardError(e.to_string()))?
         );
         
@@ -157,36 +157,30 @@ impl CliHandler {
                 .map_err(|e| CliError::TimerError(e.to_string()))?;
             timer
         }));
-
-        // 首先克隆所需的引用
-        let status_clone = self.service_status.clone();
-        let should_stop_clone = self.should_stop.clone();
-        let config_clone = self.config.clone();
-        
-        // 设置事件回调
-        self.setup_event_callbacks(&clipboard_monitor, &destruct_timer, timer_duration);
         
         // 保存组件引用（在注册热键之前）
         self.clipboard_monitor = Some(clipboard_monitor.clone());
         self.destruct_timer = Some(destruct_timer.clone());
         
+        // 设置事件回调
+        self.setup_event_callbacks(&clipboard_monitor, &destruct_timer, timer_duration);
+        
         // 注册全局热键
-        if config_clone.hotkeys.enable_global_hotkeys {
+        if self.config.hotkeys.enable_global_hotkeys {
             self.register_global_hotkeys(&clipboard_monitor, &destruct_timer)?;
         }
         
         // 更新服务状态
         {
-            let mut status = status_clone.lock().unwrap();
+            let mut status = self.service_status.lock().unwrap();
             status.is_running = true;
             status.start_time = Some(Instant::now());
             status.total_events = 0;
         }
         
-        // 启动监听循环
-        let poll_interval = config_clone.get_poll_interval();
-        
-        // 在后台启动监听任务
+        // 启动监听循环（在后台）
+        let poll_interval = self.config.get_poll_interval();
+        let status_clone = self.service_status.clone();
         let monitor_task = {
             let monitor = clipboard_monitor.clone();
             tokio::spawn(async move {
@@ -202,21 +196,14 @@ impl CliHandler {
         
         println!("✅ ClipVanish服务已启动");
         println!("   自毁倒计时: {}秒", timer_duration);
-        println!("   紧急销毁热键: {}", config_clone.hotkeys.emergency_nuke_key);
+        println!("   紧急销毁热键: {}", self.config.hotkeys.emergency_nuke_key);
         
         if !daemon_mode {
-            println!("\n📊 实时状态 (按 Ctrl+C 退出):");
+            println!("\n📊 实时状态 (输入命令继续操作):");
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-            return Ok(());
         }
         
-        // 在后台模式下等待任务完成
-        tokio::select! {
-            _ = monitor_task => {
-                debug!("监听任务结束");
-            }
-        }
-        
+        // 将监听任务放入后台运行，立即返回以保持命令行可用
         Ok(())
     }
     
@@ -400,9 +387,17 @@ impl CliHandler {
                     Self::format_duration(elapsed)
                 );
                 
-                match item.operation {
+                match &item.operation {
                     ClipboardOperation::Copy => {
-                        println!("   📥 复制: {} 字节", item.length);
+                        if let Some(content) = &item.content {
+                            let preview = if content.len() > 50 {
+                                format!("{}...", &content[..47])
+                            } else {
+                                content.clone()
+                            };
+                            println!("   📥 复制: \"{}\"", preview);
+                            println!("      大小: {} 字节", item.length);
+                        }
                     },
                     ClipboardOperation::Paste => {
                         println!("   📤 粘贴操作");
@@ -436,12 +431,13 @@ impl CliHandler {
         let timer_clone = destruct_timer.clone();
         let status_clone = self.service_status.clone();
         let show_progress = self.config.ui.show_progress;
+        let monitor_clone = clipboard_monitor.clone();
         
         // 剪贴板事件回调
         let clipboard_callback = Arc::new(move |event: ClipboardEvent| {
             match event {
                 ClipboardEvent::ContentCopied { length, timestamp, .. } => {
-                    println!("🔒 检测到剪贴板内容 ({}字节) - 已加密存储", length);
+                    info!("🔒 检测到剪贴板内容 ({}字节) - 已加密存储", length);
                     
                     // 启动倒计时
                     if let Ok(timer) = timer_clone.lock() {
@@ -460,7 +456,11 @@ impl CliHandler {
                 },
                 ClipboardEvent::ContentCleared { reason, .. } => {
                     match reason {
-                        ClearReason::TimerExpired => println!("🔥 倒计时结束 - 剪贴板已自动清除"),
+                        ClearReason::TimerExpired => {
+                            // 倒计时结束时，清除超时记录
+                            monitor_clone.clear_expired_history();
+                            println!("🔥 倒计时结束 - 剪贴板已自动清除");
+                        },
                         ClearReason::ManualClear => println!("🧹 剪贴板已手动清除"),
                         ClearReason::EmergencyNuke => println!("💥 紧急销毁 - 所有数据已清除"),
                         ClearReason::Shutdown => debug!("程序退出时清除剪贴板"),

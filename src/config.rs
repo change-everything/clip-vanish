@@ -86,6 +86,8 @@ pub struct SecurityConfig {
     pub enable_key_rotation: bool,
     /// 密钥轮换间隔（分钟）
     pub key_rotation_interval: u64,
+    /// 是否在粘贴后立即销毁
+    pub destroy_on_paste: bool,
 }
 
 impl Default for SecurityConfig {
@@ -96,6 +98,7 @@ impl Default for SecurityConfig {
             auto_clear_on_exit: true,
             enable_key_rotation: false,
             key_rotation_interval: 60, // 1小时
+            destroy_on_paste: true,  // 默认启用粘贴即销毁
         }
     }
 }
@@ -232,13 +235,58 @@ impl Config {
     /// # 返回值
     /// * `Result<Config, ConfigError>` - 成功返回配置实例
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let content = fs::read_to_string(path)
+        let content = fs::read_to_string(path.as_ref())
             .map_err(ConfigError::FileReadError)?;
         
-        let config: Config = serde_json::from_str(&content)
-            .map_err(ConfigError::ParseError)?;
+        // 尝试加载配置
+        let result: Result<Config, _> = serde_json::from_str(&content);
         
-        config.validate()?;
+        let config = match result {
+            Ok(config) => {
+                // 配置加载成功，验证并返回
+                config.validate()?;
+                config
+            },
+            Err(e) => {
+                warn!("配置加载出现问题: {}", e);
+                info!("尝试使用现有值并添加缺失的字段...");
+                
+                // 创建默认配置
+                let default_config = Config::default();
+                
+                // 尝试解析现有配置
+                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(obj) = json.as_object_mut() {
+                        // 添加缺失的安全配置字段
+                        if let Some(security) = obj.get_mut("security") {
+                            if let Some(security_obj) = security.as_object_mut() {
+                                if !security_obj.contains_key("destroy_on_paste") {
+                                    security_obj.insert(
+                                        "destroy_on_paste".to_string(),
+                                        serde_json::Value::Bool(default_config.security.destroy_on_paste)
+                                    );
+                                }
+                            }
+                        }
+                        
+                        // 保存更新后的配置并重新加载
+                        let path_ref = path.as_ref();
+                        let updated_content = serde_json::to_string_pretty(&json)
+                            .map_err(ConfigError::ParseError)?;
+                        fs::write(path_ref, &updated_content)
+                            .map_err(ConfigError::FileWriteError)?;
+                        
+                        // 使用更新后的内容直接解析，而不是重新读取文件
+                        return serde_json::from_str(&updated_content)
+                            .map_err(ConfigError::ParseError);
+                    }
+                }
+                
+                // 如果更新失败，返回默认配置
+                warn!("无法修复配置文件，使用默认配置");
+                default_config
+            }
+        };
         
         info!("配置加载成功");
         Ok(config)
@@ -443,6 +491,7 @@ impl Config {
         println!("   擦除轮数: {}轮", self.security.memory_erase_rounds);
         println!("   退出时清除: {}", if self.security.auto_clear_on_exit { "是" } else { "否" });
         println!("   密钥轮换: {}", if self.security.enable_key_rotation { "启用" } else { "禁用" });
+        println!("   粘贴即销毁: {}", if self.security.destroy_on_paste { "启用" } else { "禁用" });
         println!();
         
         println!("🎨 界面配置:");

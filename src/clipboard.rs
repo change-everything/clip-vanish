@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use log::{info, warn, error, debug};
+use crate::config::Config;
 use crate::crypto::{CryptoEngine, EncryptedData, CryptoError};
 use crate::memory::SecureMemory;
 
@@ -134,6 +135,8 @@ pub struct ClipboardHistoryItem {
     pub content_type: ContentType,
     /// 操作类型
     pub operation: ClipboardOperation,
+    /// 明文内容（如果是复制操作）
+    pub content: Option<String>,
 }
 
 /// 剪贴板监听器状态
@@ -171,6 +174,8 @@ pub struct ClipboardMonitor {
     state: Arc<Mutex<ClipboardState>>,
     /// 历史记录
     history: Arc<Mutex<Vec<ClipboardHistoryItem>>>,
+    /// 配置
+    config: Arc<Config>,
 }
 
 impl ClipboardMonitor {
@@ -178,7 +183,7 @@ impl ClipboardMonitor {
     /// 
     /// # 返回值
     /// * `Result<ClipboardMonitor, ClipboardError>` - 成功返回监听器实例
-    pub fn new() -> Result<Self, ClipboardError> {
+    pub fn new(config: Config) -> Result<Self, ClipboardError> {
         let clipboard_ctx = ClipboardContext::new()
             .map_err(|e| ClipboardError::AccessFailed(e.to_string()))?;
         
@@ -202,6 +207,7 @@ impl ClipboardMonitor {
             last_content_hash: Arc::new(Mutex::new(0)),
             state: Arc::new(Mutex::new(state)),
             history: Arc::new(Mutex::new(Vec::new())),
+            config: Arc::new(config),
         })
     }
     
@@ -258,6 +264,14 @@ impl ClipboardMonitor {
             if content_hash != last_hash {
                 debug!("检测到剪贴板内容变化");
                 
+                // 显示复制的内容预览（最多显示50个字符）
+                let preview = if content.len() > 50 {
+                    format!("{}...", &content[..47])
+                } else {
+                    content.clone()
+                };
+                println!("📋 检测到复制内容: \"{}\"", preview);
+                
                 // 加密新内容
                 let encrypted = {
                     let crypto = self.crypto_engine.lock().unwrap();
@@ -287,6 +301,7 @@ impl ClipboardMonitor {
                     length: content.len(),
                     content_type: ContentType::Text,
                     operation: ClipboardOperation::Copy,
+                    content: Some(content.clone()), // 存储明文内容
                 });
                 
                 // 触发事件回调
@@ -326,7 +341,49 @@ impl ClipboardMonitor {
         }
     }
     
-    /// 获取解密后的剪贴板内容
+    /// 删除指定的历史记录
+    pub fn remove_history_item(&self, content: &str) {
+        let mut history = self.history.lock().unwrap();
+        if let Some(index) = history.iter().position(|item| {
+            item.content.as_ref().map_or(false, |c| c == content)
+        }) {
+            history.remove(index);
+            debug!("已删除历史记录项");
+        }
+    }
+
+    /// 清除超时的历史记录
+    pub fn clear_expired_history(&self) {
+        let mut history = self.history.lock().unwrap();
+        history.retain(|item| {
+            if let Some(content) = &item.content {
+                // 在倒计时结束时删除对应记录
+                if item.timestamp.elapsed() >= Duration::from_secs(30) {
+                    debug!("删除已过期的历史记录: {}", content);
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        });
+    }
+
+    /// 处理粘贴操作
+    pub fn handle_paste(&self, content: &str) -> Result<(), ClipboardError> {
+        if let Some(decrypted) = self.get_decrypted_content()? {
+            // 如果配置了粘贴即销毁，则删除对应记录
+            if self.config.security.destroy_on_paste {
+                self.remove_history_item(&decrypted);
+                // 清除剪贴板内容
+                self.clear_clipboard(ClearReason::ManualClear)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 获取解密后的剪贴板内容并处理粘贴操作
     /// 
     /// # 返回值
     /// * `Result<Option<String>, ClipboardError>` - 解密后的内容
@@ -338,6 +395,14 @@ impl ClipboardMonitor {
             let decrypted_bytes = crypto.decrypt(encrypted)?;
             let content = String::from_utf8_lossy(&decrypted_bytes).to_string();
             
+            // 记录粘贴操作日志
+            info!("检测到粘贴操作，内容长度: {} 字节", content.len());
+            debug!("粘贴的内容预览: \"{}\"", if content.len() > 50 {
+                format!("{}...", &content[..47])
+            } else {
+                content.clone()
+            });
+
             // 触发粘贴事件
             if let Some(callback) = &*self.event_callback.lock().unwrap() {
                 let event = ClipboardEvent::ContentPasted {
@@ -346,8 +411,26 @@ impl ClipboardMonitor {
                 callback(event);
             }
             
+            // 如果配置了粘贴即销毁，则删除对应记录并清除剪贴板
+            if self.config.security.destroy_on_paste {
+                // 删除对应的历史记录
+                self.remove_history_item(&content);
+                
+                // 异步清除剪贴板
+                let monitor = self.clone();
+                info!("粘贴完成，正在清除剪贴板内容");
+                tokio::spawn(async move {
+                    if let Err(e) = monitor.clear_clipboard(ClearReason::ManualClear) {
+                        error!("粘贴后清除剪贴板失败: {}", e);
+                    } else {
+                        info!("剪贴板内容已成功清除");
+                    }
+                });
+            }
+            
             Ok(Some(content))
         } else {
+            debug!("剪贴板中没有加密内容");
             Ok(None)
         }
     }
@@ -469,20 +552,39 @@ impl Drop for ClipboardMonitor {
     }
 }
 
+impl Clone for ClipboardMonitor {
+    fn clone(&self) -> Self {
+        ClipboardMonitor {
+            clipboard_ctx: self.clipboard_ctx.clone(),
+            crypto_engine: self.crypto_engine.clone(),
+            encrypted_content: self.encrypted_content.clone(),
+            event_callback: self.event_callback.clone(),
+            should_stop: self.should_stop.clone(),
+            last_content_hash: self.last_content_hash.clone(),
+            state: self.state.clone(),
+            history: self.history.clone(),
+            config: self.config.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use std::sync::atomic::{AtomicUsize, Ordering};
     
     #[tokio::test]
     async fn test_clipboard_monitor_creation() {
-        let monitor = ClipboardMonitor::new();
+        let config = Config::default();
+        let monitor = ClipboardMonitor::new(config);
         assert!(monitor.is_ok());
     }
     
     #[tokio::test]
     async fn test_event_callback() {
-        let mut monitor = ClipboardMonitor::new().unwrap();
+        let config = Config::default();
+        let mut monitor = ClipboardMonitor::new(config).unwrap();
         let event_count = Arc::new(AtomicUsize::new(0));
         let event_count_clone = event_count.clone();
         
@@ -500,7 +602,8 @@ mod tests {
     
     #[test]
     fn test_content_hash_calculation() {
-        let monitor = ClipboardMonitor::new().unwrap();
+        let config = Config::default();
+        let monitor = ClipboardMonitor::new(config).unwrap();
         
         let content1 = "Hello, World!";
         let content2 = "Hello, World!";
