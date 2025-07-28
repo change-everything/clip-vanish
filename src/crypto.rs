@@ -51,6 +51,91 @@ impl fmt::Display for CryptoError {
 
 impl std::error::Error for CryptoError {}
 
+/// 简单的Base64编码表
+const BASE64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// 简单的Base64编码实现
+///
+/// # 参数
+/// * `input` - 待编码的字节数组
+///
+/// # 返回值
+/// * `String` - Base64编码的字符串
+fn base64_encode(input: &[u8]) -> String {
+    let mut result = String::new();
+    let mut i = 0;
+
+    while i < input.len() {
+        let b1 = input[i];
+        let b2 = if i + 1 < input.len() { input[i + 1] } else { 0 };
+        let b3 = if i + 2 < input.len() { input[i + 2] } else { 0 };
+
+        let n = ((b1 as u32) << 16) | ((b2 as u32) << 8) | (b3 as u32);
+
+        result.push(BASE64_CHARS[((n >> 18) & 63) as usize] as char);
+        result.push(BASE64_CHARS[((n >> 12) & 63) as usize] as char);
+        result.push(if i + 1 < input.len() { BASE64_CHARS[((n >> 6) & 63) as usize] as char } else { '=' });
+        result.push(if i + 2 < input.len() { BASE64_CHARS[(n & 63) as usize] as char } else { '=' });
+
+        i += 3;
+    }
+
+    result
+}
+
+/// 简单的Base64解码实现
+///
+/// # 参数
+/// * `input` - Base64编码的字符串
+///
+/// # 返回值
+/// * `Result<Vec<u8>, String>` - 解码后的字节数组
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let input = input.trim_end_matches('=');
+    let mut result = Vec::new();
+    let mut chars = input.chars().collect::<Vec<_>>();
+
+    // 补齐到4的倍数
+    while chars.len() % 4 != 0 {
+        chars.push('=');
+    }
+
+    let mut i = 0;
+    while i < chars.len() {
+        let c1 = char_to_base64_value(chars[i])?;
+        let c2 = char_to_base64_value(chars[i + 1])?;
+        let c3 = if chars[i + 2] == '=' { 0 } else { char_to_base64_value(chars[i + 2])? };
+        let c4 = if chars[i + 3] == '=' { 0 } else { char_to_base64_value(chars[i + 3])? };
+
+        let n = (c1 << 18) | (c2 << 12) | (c3 << 6) | c4;
+
+        result.push((n >> 16) as u8);
+        if chars[i + 2] != '=' {
+            result.push((n >> 8) as u8);
+        }
+        if chars[i + 3] != '=' {
+            result.push(n as u8);
+        }
+
+        i += 4;
+    }
+
+    Ok(result)
+}
+
+/// 将字符转换为Base64值
+fn char_to_base64_value(c: char) -> Result<u32, String> {
+    match c {
+        'A'..='Z' => Ok((c as u32) - ('A' as u32)),
+        'a'..='z' => Ok((c as u32) - ('a' as u32) + 26),
+        '0'..='9' => Ok((c as u32) - ('0' as u32) + 52),
+        '+' => Ok(62),
+        '/' => Ok(63),
+        '=' => Ok(0),
+        _ => Err(format!("Invalid Base64 character: {}", c)),
+    }
+}
+
 /// 安全密钥结构体
 /// 
 /// 自动实现内存零化，确保密钥在销毁时被安全擦除
@@ -96,27 +181,63 @@ pub struct EncryptedData {
 
 impl EncryptedData {
     /// 创建新的加密数据结构
-    /// 
+    ///
     /// # 参数
     /// * `nonce` - 随机nonce
     /// * `ciphertext` - 加密后的密文
     pub fn new(nonce: [u8; NONCE_LENGTH], ciphertext: Vec<u8>) -> Self {
         Self { nonce, ciphertext }
     }
-    
+
     /// 获取nonce
     pub fn nonce(&self) -> &[u8; NONCE_LENGTH] {
         &self.nonce
     }
-    
+
     /// 获取密文
     pub fn ciphertext(&self) -> &[u8] {
         &self.ciphertext
     }
-    
+
     /// 获取总长度（nonce + 密文）
     pub fn total_length(&self) -> usize {
         NONCE_LENGTH + self.ciphertext.len()
+    }
+
+    /// 将加密数据编码为Base64字符串（用于存储到剪贴板）
+    ///
+    /// # 返回值
+    /// * `String` - Base64编码的加密数据
+    pub fn to_base64(&self) -> String {
+        // 将nonce和密文合并
+        let mut combined = Vec::with_capacity(NONCE_LENGTH + self.ciphertext.len());
+        combined.extend_from_slice(&self.nonce);
+        combined.extend_from_slice(&self.ciphertext);
+
+        // 使用简单的Base64编码
+        base64_encode(&combined)
+    }
+
+    /// 从Base64字符串解码为加密数据
+    ///
+    /// # 参数
+    /// * `base64_str` - Base64编码的字符串
+    ///
+    /// # 返回值
+    /// * `Result<EncryptedData, CryptoError>` - 解码后的加密数据
+    pub fn from_base64(base64_str: &str) -> Result<Self, CryptoError> {
+        let combined = base64_decode(base64_str)
+            .map_err(|_| CryptoError::InvalidCiphertext)?;
+
+        if combined.len() < NONCE_LENGTH {
+            return Err(CryptoError::InvalidCiphertext);
+        }
+
+        let mut nonce = [0u8; NONCE_LENGTH];
+        nonce.copy_from_slice(&combined[..NONCE_LENGTH]);
+        let ciphertext = combined[NONCE_LENGTH..].to_vec();
+
+        Ok(EncryptedData::new(nonce, ciphertext))
     }
 }
 
@@ -168,20 +289,44 @@ impl CryptoEngine {
     }
     
     /// 解密密文数据
-    /// 
+    ///
     /// # 参数
     /// * `encrypted_data` - 待解密的加密数据
-    /// 
+    ///
     /// # 返回值
     /// * `Result<Vec<u8>, CryptoError>` - 成功返回明文数据
     pub fn decrypt(&self, encrypted_data: &EncryptedData) -> Result<Vec<u8>, CryptoError> {
         let nonce = Nonce::from_slice(&encrypted_data.nonce);
-        
+
         // 执行解密操作
         let plaintext = self.cipher
             .decrypt(nonce, encrypted_data.ciphertext.as_ref())
             .map_err(|_| CryptoError::DecryptionFailed)?;
-        
+
+        Ok(plaintext)
+    }
+
+    /// 解密密文数据并立即重置密钥（用于粘贴操作）
+    ///
+    /// 根据PRD要求，在粘贴时解密一次后要立刻重置密钥以增强安全性
+    ///
+    /// # 参数
+    /// * `encrypted_data` - 待解密的加密数据
+    ///
+    /// # 返回值
+    /// * `Result<Vec<u8>, CryptoError>` - 成功返回明文数据
+    pub fn decrypt_and_reset_key(&mut self, encrypted_data: &EncryptedData) -> Result<Vec<u8>, CryptoError> {
+        let nonce = Nonce::from_slice(&encrypted_data.nonce);
+
+        // 执行解密操作
+        let plaintext = self.cipher
+            .decrypt(nonce, encrypted_data.ciphertext.as_ref())
+            .map_err(|_| CryptoError::DecryptionFailed)?;
+
+        // 立即重置密钥以增强安全性
+        self.regenerate_key()?;
+
+        log::info!("解密完成并已重置密钥，增强安全性");
         Ok(plaintext)
     }
     
@@ -276,11 +421,69 @@ mod tests {
     fn test_key_regeneration() {
         let mut engine = CryptoEngine::new().unwrap();
         let original_fingerprint = engine.key_fingerprint();
-        
+
         engine.regenerate_key().unwrap();
         let new_fingerprint = engine.key_fingerprint();
-        
+
         // 密钥重新生成后指纹应该不同
         assert_ne!(original_fingerprint, new_fingerprint);
+    }
+
+    #[test]
+    fn test_decrypt_and_reset_key() {
+        let mut engine = CryptoEngine::new().unwrap();
+        let plaintext = b"Secret message for paste";
+        let original_fingerprint = engine.key_fingerprint();
+
+        // 加密
+        let encrypted = engine.encrypt(plaintext).unwrap();
+
+        // 解密并重置密钥
+        let decrypted = engine.decrypt_and_reset_key(&encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+
+        // 密钥应该已经重置
+        let new_fingerprint = engine.key_fingerprint();
+        assert_ne!(original_fingerprint, new_fingerprint);
+
+        // 用旧密钥加密的数据在密钥重置后应该无法解密
+        // （这是预期行为，因为密钥已经改变）
+        let decrypt_result = engine.decrypt(&encrypted);
+        assert!(decrypt_result.is_err());
+    }
+
+    #[test]
+    fn test_base64_encoding_decoding() {
+        let engine = CryptoEngine::new().unwrap();
+        let plaintext = b"Hello, ClipVanish Base64 test!";
+
+        // 加密
+        let encrypted = engine.encrypt(plaintext).unwrap();
+
+        // 转换为Base64
+        let base64_str = encrypted.to_base64();
+        assert!(!base64_str.is_empty());
+
+        // 从Base64恢复
+        let recovered = EncryptedData::from_base64(&base64_str).unwrap();
+
+        // 验证恢复的数据与原始加密数据相同
+        assert_eq!(recovered.nonce(), encrypted.nonce());
+        assert_eq!(recovered.ciphertext(), encrypted.ciphertext());
+
+        // 验证可以正确解密
+        let decrypted = engine.decrypt(&recovered).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_base64_invalid_input() {
+        // 测试无效的Base64输入
+        let result = EncryptedData::from_base64("invalid base64!");
+        assert!(result.is_err());
+
+        // 测试太短的输入
+        let result = EncryptedData::from_base64("dGVzdA=="); // "test" in base64, too short
+        assert!(result.is_err());
     }
 }

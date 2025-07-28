@@ -14,12 +14,15 @@
 use clipboard::{ClipboardProvider, ClipboardContext};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::ptr;
 use tokio::time::sleep;
 use log::{info, warn, error, debug};
 use regex::Regex;
 use crate::config::Config;
 use crate::crypto::{CryptoEngine, EncryptedData, CryptoError};
 use crate::memory::SecureMemory;
+use winapi::um::memoryapi::{VirtualAlloc, VirtualFree};
+use winapi::um::winnt::{MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE};
 
 /// 剪贴板操作错误类型
 #[derive(Debug)]
@@ -295,6 +298,15 @@ impl ClipboardMonitor {
                 // 无论是否敏感，都要更新哈希值以便下次检测
                 *self.last_content_hash.lock().unwrap() = content_hash;
 
+                // 首先检查这是否是我们自己的加密内容
+                let is_our_encrypted_content = self.is_our_encrypted_content(&content);
+
+                if is_our_encrypted_content {
+                    // 这是我们的加密内容，现在使用键盘事件监听粘贴操作
+                    debug!("检测到我们的加密内容在剪贴板中，等待键盘事件触发粘贴处理");
+                    return Ok(());
+                }
+
                 // 判断内容是否需要保护
                 // 主要基于敏感内容模式匹配
                 let needs_protection = self.is_sensitive_content(&content);
@@ -308,17 +320,33 @@ impl ClipboardMonitor {
                     };
                     println!("📋 检测到敏感内容复制: \"{}\"", preview);
 
-                    // 加密新内容但保留原始剪贴板
+                    // 加密新内容
                     let encrypted = {
                         let crypto = self.crypto_engine.lock().unwrap();
                         crypto.encrypt(content.as_bytes())?
                     };
 
-                    // 存储加密内容
+                    // 将加密后的内容（Base64编码）存储到剪贴板中
+                    let encrypted_base64 = encrypted.to_base64();
+                    let clipboard_result = {
+                        let mut ctx = self.clipboard_ctx.lock().unwrap();
+                        ctx.set_contents(encrypted_base64.clone())
+                    };
+
+                    if let Err(e) = clipboard_result {
+                        error!("将加密内容存储到剪贴板失败: {}", e);
+                        return Err(ClipboardError::WriteFailed(e.to_string()));
+                    }
+
+                    // 存储加密内容到内存（用于后续解密）
                     {
                         let mut encrypted_content = self.encrypted_content.lock().unwrap();
                         *encrypted_content = Some(encrypted.clone());
                     }
+
+                    // 更新哈希值为加密后的内容
+                    let encrypted_hash = self.calculate_content_hash(&encrypted_base64);
+                    *self.last_content_hash.lock().unwrap() = encrypted_hash;
 
                     // 更新状态
                     {
@@ -373,11 +401,8 @@ impl ClipboardMonitor {
                             });
                         }
 
-                        // 清除系统剪贴板
-                        let clear_result = {
-                            let mut ctx = clipboard_ctx.lock().unwrap();
-                            ctx.set_contents("".to_string())
-                        };
+                        // 清除系统剪贴板 - 使用真正的清除操作
+                        let clear_result = Self::clear_system_clipboard(&clipboard_ctx);
 
                         if let Err(e) = clear_result {
                             error!("清除剪贴板失败: {}", e);
@@ -421,42 +446,8 @@ impl ClipboardMonitor {
                 }
             }
         } else {
-            // 剪贴板为空，检查是否需要恢复内容
-            if let Ok(Some(decrypted)) = self.get_decrypted_content() {
-                debug!("剪贴板为空但有加密内容，自动恢复以供粘贴");
-                // 恢复内容到剪贴板
-                let restore_result = {
-                    let mut ctx = self.clipboard_ctx.lock().unwrap();
-                    ctx.set_contents(decrypted.clone())
-                };
-                if let Err(e) = restore_result {
-                    warn!("恢复剪贴板内容失败: {}", e);
-                } else {
-                    // 更新哈希值
-                    let content_hash = self.calculate_content_hash(&decrypted);
-                    *self.last_content_hash.lock().unwrap() = content_hash;
-                    debug!("已恢复剪贴板内容，等待用户粘贴");
-
-                    // 启动粘贴检测定时器
-                    // 如果用户在短时间内没有再次改变剪贴板，我们认为发生了粘贴操作
-                    let self_clone = self.clone();
-                    let content_for_paste = decrypted.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(1000)).await; // 等待1秒
-
-                        // 检查剪贴板内容是否仍然是我们恢复的内容
-                        if let Ok(Some(current_content)) = self_clone.read_clipboard_content() {
-                            if current_content.trim() == content_for_paste.trim() {
-                                // 内容没有变化，可能用户进行了粘贴操作
-                                info!("🔍 检测到可能的粘贴操作（基于剪贴板恢复）");
-                                if let Err(e) = self_clone.handle_paste(&content_for_paste) {
-                                    error!("处理粘贴操作失败: {}", e);
-                                }
-                            }
-                        }
-                    });
-                }
-            }
+            // 剪贴板为空，这种情况现在不应该发生，因为我们会将加密内容存储到剪贴板
+            debug!("剪贴板为空，检查是否有遗留的加密内容");
         }
 
         Ok(())
@@ -479,19 +470,62 @@ impl ClipboardMonitor {
 
         // 启动粘贴后的倒计时清理
         info!("检测到粘贴操作，启动倒计时清理");
-        let self_clone = self.clone();
         let content_for_cleanup = content.to_string();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(self_clone.config.clear_delay_seconds)).await;
+        let clear_delay_seconds = self.config.clear_delay_seconds;
 
-            // 删除历史记录
-            self_clone.remove_history_item(&content_for_cleanup);
+        // 获取必要的引用，避免克隆整个ClipboardMonitor
+        let clipboard_ctx = self.clipboard_ctx.clone();
+        let encrypted_content = self.encrypted_content.clone();
+        let last_content_hash = self.last_content_hash.clone();
+        let history = self.history.clone();
+        let event_callback = self.event_callback.clone();
 
-            // 清除剪贴板
-            if let Err(e) = self_clone.clear_clipboard(ClearReason::TimerExpired) {
+        // 使用标准线程而不是tokio::spawn来避免运行时上下文问题
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(clear_delay_seconds));
+
+            // 删除历史记录history.lock
+            {
+                let mut hist = history.lock().unwrap();
+                hist.retain(|item| {
+                    match &item.content {
+                        Some(content) => content != &content_for_cleanup,
+                        None => true,
+                    }
+                });
+                debug!("从历史记录中删除粘贴内容");
+            }
+
+            // 清除剪贴板 - 使用真正的清除操作
+            let clear_result = Self::clear_system_clipboard(&clipboard_ctx);
+
+            if let Err(e) = clear_result {
                 error!("清除剪贴板失败: {}", e);
             } else {
                 info!("🔥 粘贴倒计时结束 - 剪贴板已自动清除");
+
+                // 清除加密内容
+                {
+                    let mut enc_content = encrypted_content.lock().unwrap();
+                    *enc_content = None;
+                }
+
+                // 重置内容哈希为空字符串的哈希值
+                *last_content_hash.lock().unwrap() = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    "".hash(&mut hasher);
+                    hasher.finish()
+                };
+
+                // 触发事件回调
+                if let Some(callback) = &*event_callback.lock().unwrap() {
+                    callback(ClipboardEvent::ContentCleared {
+                        reason: ClearReason::TimerExpired,
+                        timestamp: Instant::now(),
+                    });
+                }
             }
 
             // 执行额外的安全清理
@@ -502,7 +536,7 @@ impl ClipboardMonitor {
     }
 
     /// 读取剪贴板内容
-    fn read_clipboard_content(&self) -> Result<Option<String>, ClipboardError> {
+    pub fn read_clipboard_content(&self) -> Result<Option<String>, ClipboardError> {
         // 尽快释放锁，减少对其他应用程序的影响
         let content_result = {
             let mut ctx = self.clipboard_ctx.lock().unwrap();
@@ -598,16 +632,12 @@ impl ClipboardMonitor {
     /// * `reason` - 清除原因
     ///
     /// # 返回值
-    /// * `Result<(), ClipboardError>` - 操作结果
+    /// * `Result<(), ClipboardError>` - 操作结果 键盘监听已启动
     pub fn clear_clipboard(&self, reason: ClearReason) -> Result<(), ClipboardError> {
         info!("清除剪贴板内容，原因: {:?}", reason);
 
-        // 清除系统剪贴板
-        let clear_result = {
-            let mut ctx = self.clipboard_ctx.lock().unwrap();
-            ctx.set_contents("".to_string())
-        };
-        clear_result.map_err(|e| ClipboardError::WriteFailed(e.to_string()))?;
+        // 清除系统剪贴板 - 使用真正的清除操作
+        Self::clear_system_clipboard(&self.clipboard_ctx)?;
 
         // 清除加密内容
         {
@@ -633,7 +663,7 @@ impl ClipboardMonitor {
         Ok(())
     }
 
-    /// 获取解密内容
+    /// 获取解密内容（用于恢复剪贴板，不重置密钥）
     pub fn get_decrypted_content(&self) -> Result<Option<String>, ClipboardError> {
         let encrypted_content = self.encrypted_content.lock().unwrap();
 
@@ -654,6 +684,33 @@ impl ClipboardMonitor {
         }
     }
 
+    /// 获取解密内容并重置密钥（用于粘贴操作）
+    ///
+    /// 根据PRD要求，在粘贴时解密一次后要立刻重置密钥
+    pub fn get_decrypted_content_for_paste(&self) -> Result<Option<String>, ClipboardError> {
+        let encrypted_content = self.encrypted_content.lock().unwrap();
+
+        if let Some(ref data) = *encrypted_content {
+            // 克隆数据以避免在持有锁时进行解密操作
+            let data_clone = data.clone();
+            drop(encrypted_content); // 释放锁
+
+            let mut crypto = self.crypto_engine.lock().unwrap();
+            match crypto.decrypt_and_reset_key(&data_clone) {
+                Ok(decrypted) => {
+                    let result = String::from_utf8(decrypted).map_err(|e| ClipboardError::ReadFailed(e.to_string()))?;
+                    Ok(Some(result))
+                },
+                Err(e) => {
+                    error!("解密剪贴板内容并重置密钥失败: {}", e);
+                    Err(ClipboardError::CryptoError(e))
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
     /// 获取当前状态
     ///
     /// # 返回值
@@ -665,6 +722,34 @@ impl ClipboardMonitor {
     /// 获取历史记录
     pub fn get_history(&self) -> Vec<ClipboardHistoryItem> {
         self.history.lock().unwrap().clone()
+    }
+
+    /// 设置剪贴板内容
+    ///
+    /// # 参数
+    /// * `content` - 要设置的内容
+    ///
+    /// # 返回值
+    /// * `Result<(), ClipboardError>` - 操作结果
+    pub fn set_clipboard_content(&self, content: &str) -> Result<(), ClipboardError> {
+        let mut ctx = self.clipboard_ctx.lock().unwrap();
+        ctx.set_contents(content.to_string())
+            .map_err(|e| ClipboardError::AccessFailed(e.to_string()))?;
+
+        // 更新哈希值
+        let content_hash = self.calculate_content_hash(content);
+        *self.last_content_hash.lock().unwrap() = content_hash;
+
+        debug!("剪贴板内容已更新，长度: {}", content.len());
+        Ok(())
+    }
+
+    /// 获取剪贴板上下文的引用
+    ///
+    /// # 返回值
+    /// * `Arc<Mutex<ClipboardContext>>` - 剪贴板上下文的引用
+    pub fn get_clipboard_context(&self) -> Arc<Mutex<ClipboardContext>> {
+        self.clipboard_ctx.clone()
     }
 
     /// 添加历史记录
@@ -687,6 +772,109 @@ impl ClipboardMonitor {
         hasher.finish()
     }
 
+    /// 真正清除系统剪贴板内容
+    ///
+    /// 使用平台特定的API执行真正的剪贴板清除操作，而不是简单地设置空字符串
+    ///
+    /// # 参数
+    /// * `clipboard_ctx` - 剪贴板上下文的引用
+    ///
+    /// # 返回值
+    /// * `Result<(), ClipboardError>` - 操作结果
+    fn clear_system_clipboard(clipboard_ctx: &Arc<Mutex<ClipboardContext>>) -> Result<(), ClipboardError> {
+        debug!("执行真正的系统剪贴板清除操作");
+
+        #[cfg(target_os = "windows")]
+        {
+            // Windows: 使用 EmptyClipboard API
+            use winapi::um::winuser::{OpenClipboard, EmptyClipboard, CloseClipboard};
+            use std::ptr;
+
+            unsafe {
+                if OpenClipboard(ptr::null_mut()) != 0 {
+                    let result = EmptyClipboard();
+                    CloseClipboard();
+
+                    if result != 0 {
+                        debug!("Windows剪贴板已通过EmptyClipboard API清除");
+                        return Ok(());
+                    } else {
+                        warn!("EmptyClipboard API调用失败，回退到设置空内容");
+                    }
+                } else {
+                    warn!("无法打开剪贴板，回退到设置空内容");
+                }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // macOS: 使用 NSPasteboard clearContents
+            use std::process::Command;
+
+            let output = Command::new("osascript")
+                .args(&["-e", "tell application \"System Events\" to set the clipboard to \"\""])
+                .output();
+
+            match output {
+                Ok(result) if result.status.success() => {
+                    debug!("macOS剪贴板已通过osascript清除");
+                    return Ok(());
+                },
+                _ => {
+                    warn!("osascript清除剪贴板失败，回退到设置空内容");
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            // Linux: 尝试使用 xclip 或 xsel 清除剪贴板
+            use std::process::Command;
+
+            // 尝试使用 xclip
+            let xclip_result = Command::new("xclip")
+                .args(&["-selection", "clipboard", "-i"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    if let Some(stdin) = child.stdin.take() {
+                        drop(stdin); // 关闭stdin，相当于传入空内容
+                    }
+                    child.wait()
+                });
+
+            if let Ok(status) = xclip_result {
+                if status.success() {
+                    debug!("Linux剪贴板已通过xclip清除");
+                    return Ok(());
+                }
+            }
+
+            // 如果xclip失败，尝试xsel
+            let xsel_result = Command::new("xsel")
+                .args(&["-bc"])
+                .output();
+
+            if let Ok(result) = xsel_result {
+                if result.status.success() {
+                    debug!("Linux剪贴板已通过xsel清除");
+                    return Ok(());
+                }
+            }
+
+            warn!("xclip和xsel都不可用，回退到设置空内容");
+        }
+
+        // 回退方案：使用clipboard crate设置空字符串
+        debug!("使用回退方案：设置空字符串到剪贴板");
+        let mut ctx = clipboard_ctx.lock().unwrap();
+        ctx.set_contents("".to_string())
+            .map_err(|e| ClipboardError::WriteFailed(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// 检查内容是否为敏感内容
     ///
     /// # 参数
@@ -695,6 +883,11 @@ impl ClipboardMonitor {
     /// # 返回值
     /// * `bool` - 是否为敏感内容
     fn is_sensitive_content(&self, content: &str) -> bool {
+        // 空字符串不被认为是敏感内容
+        if content.is_empty() {
+            return false;
+        }
+
         let regex_guard = self.sensitive_regex.lock().unwrap();
 
         if let Some(ref regex) = *regex_guard {
@@ -710,6 +903,27 @@ impl ClipboardMonitor {
             }
         }
     }
+
+    /// 检查内容是否是我们的加密内容
+    ///
+    /// # 参数
+    /// * `content` - 要检查的内容
+    ///
+    /// # 返回值
+    /// * `bool` - 是否是我们的加密内容
+    pub fn is_our_encrypted_content(&self, content: &str) -> bool {
+        // 检查是否有存储的加密内容
+        let encrypted_content = self.encrypted_content.lock().unwrap();
+        if let Some(ref stored_encrypted) = *encrypted_content {
+            // 比较当前剪贴板内容是否与我们存储的加密内容的Base64编码相匹配
+            let stored_base64 = stored_encrypted.to_base64();
+            content.trim() == stored_base64.trim()
+        } else {
+            false
+        }
+    }
+
+
 
     /// 紧急销毁所有数据
     ///
@@ -809,22 +1023,41 @@ mod tests {
 
     #[test]
     fn test_sensitive_content_detection() {
+        // 测试默认配置（匹配所有内容）
         let config = Config::default();
         let monitor = ClipboardMonitor::new(config).unwrap();
 
-        // 测试敏感内容
+        // 默认配置下，所有非空内容都被认为是敏感的
         assert!(monitor.is_sensitive_content("password123"));
         assert!(monitor.is_sensitive_content("my secret"));
         assert!(monitor.is_sensitive_content("api_key"));
         assert!(monitor.is_sensitive_content("private data"));
         assert!(monitor.is_sensitive_content("auth token"));
         assert!(monitor.is_sensitive_content("bearer token"));
+        assert!(monitor.is_sensitive_content("hello world"));
+        assert!(monitor.is_sensitive_content("normal text"));
+        assert!(monitor.is_sensitive_content("just some text"));
+
+        // 空字符串不被认为是敏感的
+        assert!(!monitor.is_sensitive_content(""));
+
+        // 测试自定义模式
+        let mut custom_config = Config::default();
+        custom_config.sensitive_pattern = "(?i)password|secret|token|api[_-]?key".to_string();
+        let custom_monitor = ClipboardMonitor::new(custom_config).unwrap();
+
+        // 测试敏感内容
+        assert!(custom_monitor.is_sensitive_content("password123"));
+        assert!(custom_monitor.is_sensitive_content("my secret"));
+        assert!(custom_monitor.is_sensitive_content("api_key"));
+        assert!(custom_monitor.is_sensitive_content("auth token"));
+        assert!(custom_monitor.is_sensitive_content("bearer token"));
 
         // 测试非敏感内容
-        assert!(!monitor.is_sensitive_content("hello world"));
-        assert!(!monitor.is_sensitive_content("normal text"));
-        assert!(!monitor.is_sensitive_content("just some text"));
-        assert!(!monitor.is_sensitive_content(""));
+        assert!(!custom_monitor.is_sensitive_content("hello world"));
+        assert!(!custom_monitor.is_sensitive_content("normal text"));
+        assert!(!custom_monitor.is_sensitive_content("just some text"));
+        assert!(!custom_monitor.is_sensitive_content(""));
     }
 
     #[test]
@@ -842,5 +1075,56 @@ mod tests {
 
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_clear_system_clipboard() {
+        // 创建测试配置
+        let config = Config::default();
+        let monitor = ClipboardMonitor::new(config).expect("创建监听器失败");
+
+        // 先设置一些内容到剪贴板
+        let set_result = monitor.set_clipboard_content("测试内容");
+        if set_result.is_err() {
+            println!("⚠️  剪贴板访问受限，跳过测试");
+            return;
+        }
+
+        // 验证内容已设置
+        let content = monitor.read_clipboard_content().expect("读取剪贴板失败");
+        if content.is_none() {
+            println!("⚠️  剪贴板内容读取为空，可能是环境限制，跳过测试");
+            return;
+        }
+
+        assert_eq!(content.unwrap(), "测试内容");
+
+        // 使用新的清除方法
+        ClipboardMonitor::clear_system_clipboard(&monitor.clipboard_ctx).expect("清除剪贴板失败");
+
+        // 验证剪贴板已清除
+        let content_after_clear = monitor.read_clipboard_content().expect("读取剪贴板失败");
+        assert!(content_after_clear.is_none() || content_after_clear == Some("".to_string()));
+
+        println!("✅ 系统剪贴板清除测试通过");
+    }
+
+    #[test]
+    fn test_clear_clipboard_method() {
+        // 创建测试配置
+        let config = Config::default();
+        let monitor = ClipboardMonitor::new(config).expect("创建监听器失败");
+
+        // 先设置一些内容到剪贴板
+        monitor.set_clipboard_content("另一个测试内容").expect("设置剪贴板内容失败");
+
+        // 使用clear_clipboard方法
+        monitor.clear_clipboard(ClearReason::ManualClear).expect("清除剪贴板失败");
+
+        // 验证剪贴板已清除
+        let content_after_clear = monitor.read_clipboard_content().expect("读取剪贴板失败");
+        assert!(content_after_clear.is_none() || content_after_clear == Some("".to_string()));
+
+        println!("✅ clear_clipboard方法测试通过");
     }
 }

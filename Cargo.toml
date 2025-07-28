@@ -42,6 +42,10 @@ rdev = "0.4"
 libc = "0.2"
 tempfile = "3.20.0"
 
+# Windows API 支持
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["memoryapi", "processthreadsapi", "winnt", "errhandlingapi", "sysinfoapi", "winuser"] }
+
 # 平台特定的键盘监听依赖
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS Core Graphics 和 Cocoa
@@ -49,16 +53,10 @@ core-graphics = "0.23"
 cocoa = "0.25"
 objc = "0.2"
 
-[target.'cfg(target_os = "windows")'.dependencies]
-# Windows API
-winapi = { version = "0.3", features = ["winuser", "processthreadsapi", "libloaderapi", "errhandlingapi"] }
-
 [target.'cfg(target_os = "linux")'.dependencies]
 # X11 事件监听
 x11 = { version = "2.21", features = ["xlib", "xtest"] }
 libc = "0.2"
-
-
 
 [profile.release]
 # 发布版本优化

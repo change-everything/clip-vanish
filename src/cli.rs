@@ -230,8 +230,11 @@ impl CliHandler {
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             println!("🔄 监听服务已在后台运行，程序将持续运行直到手动停止");
 
-            // 使用一个无限循环来保持程序运行，而不是等待监听任务
-            // 这样即使监听任务因为某种原因结束，程序也不会退出
+            // 使用一个无限循环来保持程序运行，并在监听任务结束时重新启动
+            let mut current_monitor_task = monitor_task;
+            let mut restart_count = 0;
+            const MAX_RESTART_ATTEMPTS: u32 = 5;
+
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -241,10 +244,33 @@ impl CliHandler {
                 }
 
                 // 检查监听任务是否还在运行
-                if monitor_task.is_finished() {
-                    warn!("监听任务意外结束，尝试重新启动...");
-                    // 这里可以添加重新启动监听的逻辑
-                    break;
+                if current_monitor_task.is_finished() {
+                    if restart_count < MAX_RESTART_ATTEMPTS {
+                        restart_count += 1;
+                        warn!("监听任务意外结束，尝试重新启动... (第 {}/{} 次)", restart_count, MAX_RESTART_ATTEMPTS);
+
+                        // 重新启动监听任务
+                        let monitor = clipboard_monitor.clone();
+                        let status_clone = self.service_status.clone();
+                        current_monitor_task = tokio::spawn(async move {
+                            if let Err(e) = monitor.start_monitoring(poll_interval).await {
+                                error!("剪贴板监听任务失败: {}", e);
+                                // 更新状态为非运行
+                                if let Ok(mut status) = status_clone.lock() {
+                                    status.is_running = false;
+                                }
+                            }
+                        });
+
+                        // 等待一段时间再继续检查
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    } else {
+                        error!("监听任务重启次数过多，停止尝试");
+                        break;
+                    }
+                } else {
+                    // 如果任务正常运行，重置重启计数器
+                    restart_count = 0;
                 }
             }
 
@@ -579,13 +605,43 @@ impl CliHandler {
                 KeyboardEvent::PasteDetected { timestamp: _, key_combination } => {
                     info!("🔍 检测到粘贴操作: {}", key_combination);
 
-                    // 触发剪贴板的粘贴处理
-                    if let Ok(Some(decrypted_content)) = clipboard_clone.get_decrypted_content() {
-                        if let Err(e) = clipboard_clone.handle_paste(&decrypted_content) {
-                            error!("处理粘贴操作失败: {}", e);
+                    // 检查剪贴板中是否有我们的加密内容
+                    if let Ok(Some(current_content)) = clipboard_clone.read_clipboard_content() {
+                        if clipboard_clone.is_our_encrypted_content(&current_content) {
+                            info!("检测到加密内容，开始解密处理");
+
+                            // 在粘贴时进行解密并重置密钥
+                            match clipboard_clone.get_decrypted_content_for_paste() {
+                                Ok(Some(decrypted_content)) => {
+                                    info!("✅ 解密成功，内容长度: {} 字符", decrypted_content.len());
+
+                                    // 立即将解密内容放到剪贴板中，替换加密内容
+                                    match clipboard_clone.set_clipboard_content(&decrypted_content) {
+                                        Ok(()) => {
+                                            info!("✅ 解密内容已放入剪贴板，用户的粘贴操作将获得明文，密钥已重置");
+
+                                            // 处理粘贴操作的后续逻辑
+                                            if let Err(e) = clipboard_clone.handle_paste(&decrypted_content) {
+                                                error!("处理粘贴操作失败: {}", e);
+                                            }
+                                        },
+                                        Err(e) => {
+                                            error!("将解密内容放入剪贴板失败: {}", e);
+                                        }
+                                    }
+                                },
+                                Ok(None) => {
+                                    warn!("解密返回空内容");
+                                },
+                                Err(e) => {
+                                    error!("粘贴时解密并重置密钥失败: {}", e);
+                                }
+                            }
+                        } else {
+                            debug!("粘贴操作检测到，但剪贴板中没有我们的加密内容");
                         }
                     } else {
-                        debug!("粘贴操作检测到，但没有加密内容需要处理");
+                        debug!("无法读取剪贴板内容");
                     }
                 },
                 KeyboardEvent::OtherShortcut { keys, .. } => {
